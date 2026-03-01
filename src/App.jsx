@@ -5,7 +5,6 @@ import {
 } from "recharts";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-// Replace with your actual API Gateway URL after deploying
 const API_BASE = process.env.REACT_APP_API_URL || "https://YOUR_API_GATEWAY_URL";
 
 const PALETTE = {
@@ -14,8 +13,6 @@ const PALETTE = {
   red: "#ff4d6d", purple: "#b48aff", yellow: "#ffd166",
   muted: "#4a6080", text: "#cce0ff", textDim: "#5a7ca0",
 };
-
-const statusColor = (pass) => pass ? PALETTE.green : PALETTE.red;
 
 // ── Upload component ──────────────────────────────────────────────────────────
 function UploadZone({ onUpload, uploading }) {
@@ -77,6 +74,8 @@ function StatusBadge({ status }) {
   const config = {
     PENDING:   { color: PALETTE.muted,   label: "● PENDING",   anim: false },
     SUBMITTED: { color: PALETTE.yellow,  label: "● SUBMITTED", anim: true },
+    STARTING:  { color: PALETTE.orange,  label: "● STARTING",  anim: true },
+    RUNNABLE:  { color: PALETTE.yellow,  label: "● RUNNABLE",  anim: true },
     RUNNING:   { color: PALETTE.accent,  label: "● RUNNING",   anim: true },
     SUCCEEDED: { color: PALETTE.green,   label: "✓ COMPLETE",  anim: false },
     FAILED:    { color: PALETTE.red,     label: "✗ FAILED",    anim: false },
@@ -96,21 +95,10 @@ function StatusBadge({ status }) {
 
 // ── QC Results viewer ─────────────────────────────────────────────────────────
 function QCResults({ results }) {
-  const [activeModule, setActiveModule] = useState("per_base_quality");
-
   if (!results) return null;
 
   const modules = results.report_modules || {};
   const summary = results.summary || [];
-
-  const moduleLabels = {
-    per_base_quality:       "Per Base Quality",
-    per_sequence_quality:   "Per Sequence Quality",
-    per_base_gc_content:    "GC Content",
-    sequence_length:        "Sequence Length",
-    sequence_duplication:   "Duplication",
-    adapter_content:        "Adapter Content",
-  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -209,16 +197,37 @@ export default function App() {
   // Poll job statuses every 10s
   useEffect(() => {
     const poll = setInterval(async () => {
-      const activeJobs = jobs.filter(j => ["SUBMITTED","RUNNING"].includes(j.status));
+      const activeJobs = jobs.filter(j =>
+        ["SUBMITTED", "RUNNING", "STARTING", "RUNNABLE", "PENDING"].includes(j.status)
+      );
       if (!activeJobs.length) return;
+
       for (const job of activeJobs) {
         try {
           const res = await fetch(`${API_BASE}/job/${job.jobId}`);
           const data = await res.json();
+
+          let results = null;
+          if (data.status === "SUCCEEDED") {
+            try {
+              const rRes = await fetch(`${API_BASE}/results/${job.jobId}`);
+              results = await rRes.json();
+            } catch (e) { /* results not ready yet */ }
+          }
+
           setJobs(prev => prev.map(j => j.jobId === job.jobId
-            ? { ...j, status: data.status, results: data.results }
+            ? { ...j, status: data.status, results: results || j.results }
             : j
           ));
+
+          // Auto-update selected job panel
+          setSelectedJob(prev => {
+            if (prev?.jobId === job.jobId) {
+              return { ...prev, status: data.status, results: results || prev.results };
+            }
+            return prev;
+          });
+
         } catch (e) { /* silently fail polling */ }
       }
     }, 10000);
@@ -236,6 +245,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ filename: file.name, filesize: file.size }),
         });
+        if (!presignRes.ok) throw new Error(`Upload endpoint returned ${presignRes.status}`);
         const { uploadUrl, s3Key, jobId } = await presignRes.json();
 
         // Step 2: Upload directly to S3
@@ -252,13 +262,16 @@ export default function App() {
           body: JSON.stringify({ jobId, s3Key, filename: file.name }),
         });
 
-        setJobs(prev => [{
+        const newJob = {
           jobId, filename: file.name,
           filesize: (file.size / 1e9).toFixed(2) + " GB",
           status: "SUBMITTED",
           submittedAt: new Date().toLocaleTimeString(),
           results: null,
-        }, ...prev]);
+        };
+
+        setJobs(prev => [newJob, ...prev]);
+        setSelectedJob(newJob);
       }
     } catch (e) {
       setError("Upload failed: " + e.message + ". Check API_BASE in .env");
@@ -279,6 +292,8 @@ export default function App() {
       setError("Could not load results: " + e.message);
     }
   };
+
+  const activeStatuses = ["SUBMITTED", "RUNNING", "STARTING", "RUNNABLE", "PENDING"];
 
   return (
     <div style={{
@@ -384,7 +399,6 @@ export default function App() {
                 Files are uploaded directly to S3 via presigned URL, then processed by FastQC running on AWS Batch.
                 Results appear here automatically when complete.
               </div>
-              {/* Architecture diagram */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 16, flexWrap: "wrap", justifyContent: "center" }}>
                 {["FASTQ Upload","→","S3 Bucket","→","AWS Batch","→","FastQC","→","Results"].map((s, i) => (
                   <span key={i} style={{
@@ -397,12 +411,13 @@ export default function App() {
                 ))}
               </div>
             </div>
-          ) : selectedJob.status === "RUNNING" || selectedJob.status === "SUBMITTED" ? (
+          ) : activeStatuses.includes(selectedJob.status) ? (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
               <div style={{ fontSize: 48, animation: "spin 2s linear infinite" }}>⟳</div>
               <div style={{ color: PALETTE.accent, fontFamily: "monospace", fontSize: 14 }}>
                 FastQC running on AWS Batch...
               </div>
+              <StatusBadge status={selectedJob.status} />
               <div style={{ color: PALETTE.textDim, fontSize: 11 }}>Typical runtime: 2–8 minutes for 1–5GB FASTQ</div>
               <div style={{ color: PALETTE.textDim, fontSize: 10, fontFamily: "monospace" }}>Job: {selectedJob.jobId}</div>
               <div style={{ color: PALETTE.textDim, fontSize: 10 }}>Auto-refreshing every 10 seconds...</div>
